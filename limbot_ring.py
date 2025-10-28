@@ -12,6 +12,14 @@ import os
 from pathlib import Path
 from datetime import datetime
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Directorios (en Cloud Run, /tmp es efímero)
 DOWNLOAD_DIR = Path("/tmp/downloads")
@@ -99,7 +107,7 @@ def keep_alive_visit() -> None:
         page.goto(BILLING_URL, wait_until="networkidle")
         _ensure_on_billing(page)
         _solve_verification_iframe(page)
-        
+
         if not _is_logged_in(page):
             ctx.close()
             raise RuntimeError(
@@ -229,3 +237,81 @@ def download_latest_invoice() -> Path:
         download.save_as(str(target))
         ctx.close()
         return target
+
+def send_invoice_by_email(pdf_path: Path) -> None:
+    """Envía la factura en PDF como adjunto por email."""
+    
+    # --- Configuración del email (desde variables de entorno) ---
+    smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", 587))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD") # ¡OJO! Contraseña de aplicación
+    recipient_email = os.getenv("RECIPIENT_EMAIL")
+
+    print(smtp_user, smtp_password, recipient_email)
+
+    if not all([smtp_user, smtp_password, recipient_email]):
+        print("⚠️  Faltan variables de entorno para el email (SMTP_USER, SMTP_PASSWORD, RECIPIENT_EMAIL). No se enviará correo.")
+        return
+
+    # --- Crear el mensaje ---
+    msg = MIMEMultipart()
+    msg["From"] = smtp_user
+    msg["To"] = recipient_email
+    
+    # Asunto con el mes y año actual
+    month_year = datetime.now().strftime("%B %Y")
+    msg["Subject"] = f"Factura de Ring - {month_year.capitalize()}"
+
+    # Cuerpo del email
+    body = f"Adjunto la última factura de Ring generada.\n\nEl fichero es: {pdf_path.name}"
+    msg.attach(MIMEText(body, "plain"))
+
+    # --- Adjuntar el archivo PDF ---
+    try:
+        with open(pdf_path, "rb") as attachment:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(attachment.read())
+        encoders.encode_base64(part)
+        part.add_header(
+            "Content-Disposition",
+            f"attachment; filename= {pdf_path.name}",
+        )
+        msg.attach(part)
+    except FileNotFoundError:
+        print(f"🚨 ERROR: No se encontró el fichero PDF en '{pdf_path}'.")
+        return
+
+    # --- Enviar el email ---
+    try:
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls() # Conexión segura
+        server.login(smtp_user, smtp_password)
+        text = msg.as_string()
+        server.sendmail(smtp_user, recipient_email, text)
+        server.quit()
+        print(f"✅ Factura enviada correctamente a {recipient_email}")
+    except Exception as e:
+        print(f"🚨 ERROR al enviar el email: {e}")
+
+# --- AÑADIR UN BLOQUE PRINCIPAL PARA ORQUESTAR TODO ---
+if __name__ == "__main__":
+    try:
+        print("🚀 Iniciando descarga de la última factura de Ring...")
+        # 1. Descargar la factura
+        invoice_path = download_latest_invoice()
+        print(f"📄 Factura descargada en: {invoice_path}")
+        
+        # 2. Enviar por email
+        send_invoice_by_email(invoice_path)
+
+    except Exception as e:
+        print(f"❌ Ocurrió un error general en el proceso: {e}")
+    
+    finally:
+        # 3. Limpieza (opcional pero recomendado)
+        # Si tienes archivos en /tmp/downloads, puedes borrarlos
+        if 'invoice_path' in locals() and invoice_path.exists():
+            # invoice_path.unlink()
+            # print(f"🧹 Fichero temporal {invoice_path} borrado.")
+            pass # Descomenta la línea de arriba si quieres borrar el PDF tras enviarlo
