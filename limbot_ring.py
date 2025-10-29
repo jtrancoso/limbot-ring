@@ -1,317 +1,225 @@
 """
-limbot_ring.py
----------------
-Playwright para Ring:
-- keep_alive_visit(): refresca la sesión (no descarga).
-- download_latest_invoice(): hace click en el primer "Descargar factura" y guarda el PDF.
-
-Asume que la tabla de "Historial de facturación" está ordenada DESC (más reciente arriba).
+Automatización para descargar la última factura de Ring y enviarla por email.
+Utiliza login programático con 2FA (TOTP) para ser 100% autónomo.
 """
-
 import os
+import smtplib
+import pyotp
 from pathlib import Path
 from datetime import datetime
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
+
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from dotenv import load_dotenv
 
+# Cargar variables de entorno desde el archivo .env al inicio
 load_dotenv()
 
-# Directorios (en Cloud Run, /tmp es efímero)
-DOWNLOAD_DIR = Path("/tmp/downloads")
-PROFILE_DIR  = Path("/tmp/ring-profile")
-
-# URL: en muchas cuentas la página buena es account.ring.com
-BILLING_URL  = os.getenv("RING_BILLING_URL", "https://account.ring.com/account/billing")
-
-# Identidad estable del “dispositivo”
-UA = os.getenv("BROWSER_UA", (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-))
-
-LOCALE = os.getenv("BROWSER_LOCALE", "es-ES")
-TZ_ID  = os.getenv("BROWSER_TZ", "Europe/Madrid")
-
-RING_PASSWORD = os.getenv("RING_PASSWORD")
+# --- CONFIGURACIÓN (leída desde variables de entorno) ---
+# Credenciales de Ring
 RING_EMAIL = os.getenv("RING_EMAIL")
+RING_PASSWORD = os.getenv("RING_PASSWORD")
+RING_TOTP_SECRET = os.getenv("RING_TOTP_SECRET")
+BILLING_URL = "https://account.ring.com/account/billing/history"
 
-def ensure_dirs() -> None:
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+# Configuración del Navegador
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-def _ensure_on_billing(page):
-    """Intenta dos veces llegar a Billing (a veces el primer salto te deja en ring.com)."""
-    for _ in range(2):
-        if "account.ring.com/account/billing" in page.url:
-            return
-        page.goto(BILLING_URL, wait_until="networkidle")
+# Configuración de Email
+SMTP_SERVER = os.getenv("SMTP_SERVER")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
 
+# Directorios
+DOWNLOAD_DIR = Path("/tmp/ring_invoices")
 
-def _open_context(p):
-    return p.chromium.launch_persistent_context(
-        user_data_dir=str(PROFILE_DIR),
-        headless=True,
-        accept_downloads=True,
-        viewport={"width": 1400, "height": 900},
-        user_agent=UA,
-        locale=LOCALE,
-        timezone_id=TZ_ID,
-    )
-
-def _is_logged_in(page) -> bool:
-    html = page.content().lower()
-    return not ("sign in" in html or "iniciar sesión" in html)
-
-DEBUG = os.getenv("LIMBOT_DEBUG", "0") == "1"
-
-def _wait_billing_table(page):
+def do_login(page):
     """
-    Espera robusta sin depender de atributos de tabla:
-    - asegura estar en Billing
-    - espera ver el encabezado 'Detalles de la factura' o, como fallback, al menos una fila en <tbody>.
+    Versión final: Su única responsabilidad es completar el login y dejar
+    la sesión establecida en la página a la que Ring redirija.
     """
-    _ensure_on_billing(page)
+    print("➡️  Iniciando sesión en Ring...")
+    # ... (El código de navegación, cookies, análisis forense, email y contraseña es idéntico)...
+    print("➡️  Navegando a la página de inicio...")
+    page.goto("https://ring.com/es/es", wait_until="networkidle")
+
     try:
-        page.wait_for_load_state("networkidle", timeout=25000)
-    except PWTimeout:
-        pass
-
-    # 1) intenta por encabezado visible
-    try:
-        page.wait_for_selector("thead th:has-text('Detalles de la factura')", timeout=12000)
-        return
-    except PWTimeout:
-        pass
-
-    # 2) fallback: espera a que exista al menos una fila de tbody
-    try:
-        page.wait_for_selector("tbody tr", timeout=12000)
-        return
-    except PWTimeout:
-        pass
-
-    # 3) último intento: cualquier “Descargar factura” visible (por si no hay thead)
-    page.wait_for_selector("a:visible:has-text('Descargar factura'), a:visible:has-text('Descargar')", timeout=12000)
-
-
-def keep_alive_visit() -> None:
-    ensure_dirs()
-    with sync_playwright() as p:
-        ctx = _open_context(p)
-        page = ctx.new_page()
-        page.goto(BILLING_URL, wait_until="networkidle")
-        _ensure_on_billing(page)
-        _solve_verification_iframe(page)
-
-        if not _is_logged_in(page):
-            ctx.close()
-            raise RuntimeError(
-                "La sesión de Ring ha caducado (pide login/2FA). "
-                "Reautentica localmente y vuelve a subir el perfil de sesión."
-            )
-
-        _wait_billing_table(page)   # ya garantiza que la tabla y las filas existen
-        page.reload(wait_until="networkidle")   # refresca cookies/tokens
-        ctx.close()
-
-def _solve_verification_iframe(page) -> bool:
-    """Si aparece el iframe /users/challenge, rellena password (y email si procede) y envía."""
-    from playwright.sync_api import TimeoutError as PWTimeout
-    try:
-        page.wait_for_selector("iframe[src*='/users/challenge'], iframe[title*='Verifica']", timeout=5000)
-    except PWTimeout:
-        return True  # no hay reto
-
-    fr = None
-    for f in page.frames:
-        if "/users/challenge" in (f.url or ""):
-            fr = f; break
-    if fr is None:
-        return False
-
-    # email (si lo muestra)
-    try:
-        email_in = fr.locator("input[type='email'], input[name='email']").first
-        if email_in.count() > 0 and RING_EMAIL:
-            email_in.fill(RING_EMAIL)
+        page.locator("button:has-text('Aceptar')").click(timeout=5000)
+        print("✅ Banner de cookies aceptado.")
+        page.wait_for_timeout(1000)
     except Exception:
-        pass
-
-    # password (a veces aparece tras un 'Continuar')
-    pwd = fr.locator("input[type='password'], input[name='password']").first
-    if pwd.count() == 0:
-        cont = fr.locator("button:has-text('Continuar'), button:has-text('Continue'), button[type='submit']").first
-        if cont.count() > 0:
-            cont.click()
-            page.wait_for_timeout(600)
-            pwd = fr.locator("input[type='password'], input[name='password']").first
-
-    if pwd.count() == 0:
-        return False
-    if not RING_PASSWORD:
-        raise RuntimeError("Define RING_PASSWORD para resolver el reto de Ring.")
-
-    # algunos inputs “controlados” se llevan mejor con type()
-    try:
-        pwd.fill("")
-        pwd.type(RING_PASSWORD, delay=40)
-    except Exception:
-        fr.evaluate("el => el.value=''", pwd)
-        pwd.type(RING_PASSWORD, delay=40)
-
-    submit = fr.locator(
-        "button[type='submit'], input[type='submit'], "
-        "button:has-text('Verificar'), button:has-text('Verify'), "
-        "button:has-text('Continuar'), button:has-text('Continue')"
-    ).first
-    if submit.count() == 0:
-        return False
-    submit.click()
+        print("⚠️  No se encontró el banner de cookies, continuando...")
 
     try:
-        page.wait_for_selector("iframe[src*='/users/challenge'], iframe[title*='Verifica']",
-                               state="detached", timeout=15000)
+        page.locator("a:has-text('Iniciar sesión'), a:has-text('Sign In')").first.click()
+        page.wait_for_load_state("networkidle", timeout=20000)
+        print("✅ Página de login cargada.")
     except Exception:
-        page.wait_for_timeout(800)
-    # si no está, lo dimos por resuelto
-    return True
+        print("⚠️  No se encontró/pulsó 'Iniciar sesión', asumiendo que ya estamos en la página correcta.")
+
+    page.wait_for_timeout(3000)
+    email_selector = "input[data-testid='input-form-field-sign-in-card'], input[name='username']"
+    login_container = page
+    if not page.locator(email_selector).count() > 0:
+        for frame in page.frames[1:]:
+            if frame.locator(email_selector).count() > 0:
+                print(f"✅ ¡Formulario encontrado en el iframe con URL: {frame.url}!")
+                login_container = frame
+                break
+    if not login_container:
+        raise Exception("No se pudo localizar el formulario de login.")
+
+    print("➡️  Rellenando email y contraseña...")
+    login_container.locator(email_selector).fill(RING_EMAIL)
+    login_container.locator("button[data-testid='submit-button-final-sign-in-card']").click()
+    password_input = login_container.locator("input[type='password']")
+    password_input.wait_for(state="visible", timeout=20000)
+    password_input.fill(RING_PASSWORD)
+    login_container.locator("button[data-testid='submit-button-final-sign-in-card']").click()
+    print("✅ Credenciales enviadas.")
+
+    print("➡️  Esperando a que la pantalla de 2FA sea visible...")
+    two_fa_title_selector = "div[data-testid='two-fa-title-sign-in-card']"
+    login_container.locator(two_fa_title_selector).wait_for(state="visible", timeout=20000)
+    print("✅ Pantalla de 2FA detectada y lista.")
+
+    print("➡️  Generando y rellenando código 2FA...")
+    totp_selector = "input[data-testid='input-form-field-two-fa-sign-in-card']"
+    totp_input = login_container.locator(totp_selector)
+    totp = pyotp.TOTP(RING_TOTP_SECRET)
+    code = totp.now()
+    totp_input.fill(code)
+
+    print("➡️  Enviando código 2FA y esperando la navegación de confirmación...")
+    verify_button_selector = "button[data-testid='submit-button-final-sign-in-card']"
+    with page.expect_navigation(wait_until="networkidle", timeout=30000):
+        login_container.locator(verify_button_selector).click()
+    
+    # --- CAMBIO CLAVE ---
+    # La función termina aquí. Su trabajo está hecho.
+    print("✅ Login completado y sesión establecida.")
+
 
 def download_latest_invoice() -> Path:
-    ensure_dirs()
+    """
+    Versión final: Utiliza la URL de facturación correcta y es más persistente
+    en la navegación post-login.
+    """
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    
     with sync_playwright() as p:
-        ctx = _open_context(p)
-        page = ctx.new_page()
-        page.goto(BILLING_URL, wait_until="networkidle")
-
-        if not _is_logged_in(page):
-            ctx.close()
-            raise RuntimeError("Sesión Ring no válida. Reautentica y sube el perfil a GCS.")
-
-        # resuelve overlay si aparece
-        _solve_verification_iframe(page)
-
-        # espera filas del historial
-        page.wait_for_selector("tbody tr", timeout=30000)
-
-        # primera fila (más reciente) → última celda (Detalles) → primer <a>/<button>
-        row = page.locator("tbody tr").first
-        last_cell = row.locator("td").last
-        cell_handle = last_cell.element_handle(timeout=5000)
-        if cell_handle is None:
-            ctx.close(); raise RuntimeError("No pude obtener la celda de 'Detalles de la factura'.")
-
-        link_handle = cell_handle.query_selector("a,button")
-        if link_handle is None:
-            last_cell.click(); page.wait_for_timeout(300)
-            link_handle = cell_handle.query_selector("a,button")
-        if link_handle is None:
-            # fallback: busca en toda la fila
-            row_handle = row.element_handle()
-            if row_handle:
-                link_handle = row_handle.query_selector("a,button")
-        if link_handle is None:
-            ctx.close(); raise RuntimeError("No encontré enlace/botón de descarga en la primera fila.")
-
-        # intenta descargar; si salta el overlay justo al clicar, resuélvelo y reintenta
-        def do_click():
-            with page.expect_download(timeout=45000) as dl_info:
-                link_handle.click()
-            return dl_info.value
+        browser = p.chromium.launch(headless=True) # Ponlo en False para la última prueba
+        context = browser.new_context(
+            user_agent=UA,
+            locale="es-ES",
+            timezone_id="Europe/Madrid",
+            accept_downloads=True
+        )
+        page = context.new_page()
 
         try:
-            download = do_click()
-        except Exception:
-            if not _solve_verification_iframe(page):
-                ctx.close(); raise
-            download = do_click()
+            # 1. Realizar el login. Nos dejará en el dashboard.
+            do_login(page)
 
-        from datetime import datetime
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        suggested = download.suggested_filename or f"ring-invoice-{stamp}.pdf"
-        target = DOWNLOAD_DIR / suggested
-        download.save_as(str(target))
-        ctx.close()
-        return target
+            print("➡️  Pausa de 2 segundos para asentar la sesión...")
+            page.wait_for_timeout(2000)
 
-def send_invoice_by_email(pdf_path: Path) -> None:
+            # --- NAVEGACIÓN ROBUSTA A LA URL CORRECTA ---
+            print(f"➡️  Navegando a la página de facturación: {BILLING_URL}")
+            # Hacemos dos intentos para asegurarnos de que llegamos
+            for attempt in range(2):
+                try:
+                    page.goto(BILLING_URL, wait_until="networkidle")
+                    # Verificamos si hemos llegado a la URL correcta o a una sub-página
+                    page.wait_for_url("**/account/billing/**", timeout=15000)
+                    print("✅ ¡Éxito! Estamos en la sección de facturación.")
+                    break # Si llegamos, salimos del bucle
+                except Exception as e:
+                    print(f"⚠️  Intento {attempt + 1} fallido. Reintentando...")
+                    if attempt == 1: # Si es el último intento y falla, lanzamos el error
+                        raise e
+            # ----------------------------------------------------
+
+            # 2. Esperar a que la tabla de facturas esté cargada
+            page.wait_for_selector("tbody tr", timeout=30000)
+
+            # 3. Descargar la factura
+            first_row = page.locator("tbody tr").first
+            download_link = first_row.locator("a:has-text('Descargar'), button:has-text('Descargar')")
+            
+            with page.expect_download(timeout=30000) as download_info:
+                download_link.click()
+            
+            download = download_info.value
+            suggested_filename = download.suggested_filename or f"ring-factura-{datetime.now():%Y-%m}.pdf"
+            save_path = DOWNLOAD_DIR / suggested_filename
+            download.save_as(save_path)
+            
+            print(f"📄 Factura descargada con éxito en: {save_path}")
+            return save_path
+
+        except Exception as e:
+            error_path = Path("/tmp/ring_error_screenshot.png")
+            page.screenshot(path=str(error_path))
+            print(f"🚨 ERROR: Ocurrió un fallo. Se ha guardado una captura en {error_path}")
+            raise e
+        finally:
+            browser.close()
+
+
+def send_invoice_by_email(pdf_path: Path):
     """Envía la factura en PDF como adjunto por email."""
-    
-    # --- Configuración del email (desde variables de entorno) ---
-    smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-    smtp_port = int(os.getenv("SMTP_PORT", 587))
-    smtp_user = os.getenv("SMTP_USER")
-    smtp_password = os.getenv("SMTP_PASSWORD") # ¡OJO! Contraseña de aplicación
-    recipient_email = os.getenv("RECIPIENT_EMAIL")
-
-    print(smtp_user, smtp_password, recipient_email)
-
-    if not all([smtp_user, smtp_password, recipient_email]):
-        print("⚠️  Faltan variables de entorno para el email (SMTP_USER, SMTP_PASSWORD, RECIPIENT_EMAIL). No se enviará correo.")
+    if not all([SMTP_USER, SMTP_PASSWORD, RECIPIENT_EMAIL]):
+        print("⚠️  Faltan variables de entorno para el email. No se enviará correo.")
         return
 
-    # --- Crear el mensaje ---
-    msg = MIMEMultipart()
-    msg["From"] = smtp_user
-    msg["To"] = recipient_email
+    print(f"➡️  Preparando email para enviar a {RECIPIENT_EMAIL}...")
     
-    # Asunto con el mes y año actual
-    month_year = datetime.now().strftime("%B %Y")
-    msg["Subject"] = f"Factura de Ring - {month_year.capitalize()}"
-
-    # Cuerpo del email
-    body = f"Adjunto la última factura de Ring generada.\n\nEl fichero es: {pdf_path.name}"
+    msg = MIMEMultipart()
+    msg["From"] = SMTP_USER
+    msg["To"] = RECIPIENT_EMAIL
+    msg["Subject"] = f"Factura de Ring - {datetime.now().strftime('%B %Y').capitalize()}"
+    
+    body = f"Se adjunta la última factura de Ring.\n\nUn besito, \n Limbot."
     msg.attach(MIMEText(body, "plain"))
 
-    # --- Adjuntar el archivo PDF ---
     try:
         with open(pdf_path, "rb") as attachment:
             part = MIMEBase("application", "octet-stream")
             part.set_payload(attachment.read())
-        encoders.encode_base64(part)
-        part.add_header(
-            "Content-Disposition",
-            f"attachment; filename= {pdf_path.name}",
-        )
-        msg.attach(part)
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f"attachment; filename= {pdf_path.name}")
+            msg.attach(part)
     except FileNotFoundError:
         print(f"🚨 ERROR: No se encontró el fichero PDF en '{pdf_path}'.")
         return
 
-    # --- Enviar el email ---
     try:
-        server = smtplib.SMTP(smtp_server, smtp_port)
-        server.starttls() # Conexión segura
-        server.login(smtp_user, smtp_password)
-        text = msg.as_string()
-        server.sendmail(smtp_user, recipient_email, text)
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.sendmail(SMTP_USER, RECIPIENT_EMAIL, msg.as_string())
         server.quit()
-        print(f"✅ Factura enviada correctamente a {recipient_email}")
+        print(f"✅ Email enviado correctamente a {RECIPIENT_EMAIL}")
     except Exception as e:
         print(f"🚨 ERROR al enviar el email: {e}")
 
-# --- AÑADIR UN BLOQUE PRINCIPAL PARA ORQUESTAR TODO ---
+
 if __name__ == "__main__":
     try:
-        print("🚀 Iniciando descarga de la última factura de Ring...")
-        # 1. Descargar la factura
-        invoice_path = download_latest_invoice()
-        print(f"📄 Factura descargada en: {invoice_path}")
+        # Paso 1: Descargar la factura
+        invoice_file_path = download_latest_invoice()
         
-        # 2. Enviar por email
-        send_invoice_by_email(invoice_path)
+        # Paso 2: Enviar la factura por email
+        if invoice_file_path:
+            send_invoice_by_email(invoice_file_path)
+        
+        print("\n🎉 Proceso completado con éxito.")
 
     except Exception as e:
-        print(f"❌ Ocurrió un error general en el proceso: {e}")
-    
-    finally:
-        # 3. Limpieza (opcional pero recomendado)
-        # Si tienes archivos en /tmp/downloads, puedes borrarlos
-        if 'invoice_path' in locals() and invoice_path.exists():
-            # invoice_path.unlink()
-            # print(f"🧹 Fichero temporal {invoice_path} borrado.")
-            pass # Descomenta la línea de arriba si quieres borrar el PDF tras enviarlo
+        print(f"\n❌ El proceso falló con un error: {e}")
