@@ -1,0 +1,5 @@
+{
+  "scripts": {
+    "gcp-build": "playwright install --with-deps chromium"
+  }
+}

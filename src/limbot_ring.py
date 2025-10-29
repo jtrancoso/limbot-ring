@@ -185,7 +185,7 @@ def send_invoice_by_email(pdf_path: Path):
     msg["To"] = RECIPIENT_EMAIL
     msg["Subject"] = f"Factura de Ring - {datetime.now().strftime('%B %Y').capitalize()}"
     
-    body = f"Se adjunta la última factura de Ring.\n\nUn besito, \n Limbot."
+    body = f"Se adjunta la última factura de Ring.\n\nUn besito, \nLimbot."
     msg.attach(MIMEText(body, "plain"))
 
     try:
