@@ -75,6 +75,7 @@ def do_login(page):
         raise Exception("No se pudo localizar el formulario de login.")
 
     print("➡️  Rellenando email y contraseña...")
+
     login_container.locator(email_selector).fill(RING_EMAIL)
     login_container.locator("button[data-testid='submit-button-final-sign-in-card']").click()
     password_input = login_container.locator("input[type='password']")
@@ -113,7 +114,8 @@ def download_latest_invoice() -> Path:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True) # Ponlo en False para la última prueba
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+
         context = browser.new_context(
             user_agent=UA,
             locale="es-ES",
@@ -121,6 +123,8 @@ def download_latest_invoice() -> Path:
             accept_downloads=True
         )
         page = context.new_page()
+        page.wait_for_timeout(2000)
+        
 
         try:
             # 1. Realizar el login. Nos dejará en el dashboard.

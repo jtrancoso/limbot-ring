@@ -1,25 +1,37 @@
-# main.py
-import limbot_ring
+from flask import Flask, request
+import os
+import base64
+import limbot_ring  # tu módulo
 
-def run_ring_automation(event, context):
-    """
-    Punto de entrada para la Cloud Function.
-    Este es el nombre de la función que Google Cloud ejecutará.
-    """
-    print("🚀 Cloud Function triggered. Starting Ring invoice automation...")
-    
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "✅ Cloud Run Flask funcionando correctamente", 200
+
+@app.route("/run", methods=["POST"])
+def run_automation():
     try:
-        # Paso 1: Descargar la factura
-        invoice_file_path = limbot_ring.download_latest_invoice()
-        
-        # Paso 2: Enviar la factura por email
-        if invoice_file_path:
-            limbot_ring.send_invoice_by_email(invoice_file_path)
-        
-        print("✅ Process completed successfully.")
-    
+        envelope = request.get_json()
+        if envelope and "message" in envelope:
+            data = envelope["message"].get("data")
+            if data:
+                msg = base64.b64decode(data).decode("utf-8").strip()
+                print(f"📨 Mensaje Pub/Sub recibido: {msg}")
+
+        print("🚀 Iniciando automatización de factura...")
+        invoice = limbot_ring.download_latest_invoice()
+        if invoice:
+            limbot_ring.send_invoice_by_email(invoice)
+        print("✅ Proceso completado correctamente.")
+        return "Success", 200
+
     except Exception as e:
-        # Imprimir el error es crucial para poder verlo en los logs de Google Cloud
-        print(f"❌ An error occurred during the process: {e}")
-        # Relanzar la excepción para que la ejecución se marque como fallida
-        raise e
+        print(f"❌ Error: {e}")
+        return str(e), 500
+
+
+if __name__ == "__main__":
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/ms-playwright"
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)

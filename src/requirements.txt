@@ -1,3 +1,4 @@
-playwright
+playwright==1.45.0
+flask
 python-dotenv
 pyotp
